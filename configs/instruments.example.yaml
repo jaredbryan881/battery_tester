@@ -1,0 +1,50 @@
+visa_backend: "@py"
+data_dir: "./data"
+
+# DMM
+sdm3055:
+  resource: "TCPIP0::10.11.13.220::INSTR"
+  timeout_ms: 5000
+
+# Power supply
+spd3303x:
+  resource: "TCPIP0::10.11.13.221::INSTR"
+  timeout_ms: 5000
+
+# Electronic load
+dl3021:
+  resource: "USB0::0x1AB1::0x0E11::DL3A204800971::INSTR"
+  timeout_ms: 5000
+
+# Charge/discharge relay
+relay:
+  port: "/dev/cu.usbserial-1140"
+  baudrate: 9600
+  timeout_s: 1.0
+
+# Charge/discharge truth table
+routing:
+  safe:
+    relay1: false
+    relay2: false
+  charge:
+    relay1: true
+    relay2: false
+  discharge:
+    relay1: false
+    relay2: true
+  forbidden:
+    relay1: true
+    relay2: true
+
+battery_defaults:
+  chemistry: "li-ion-18650"
+  v_charge_max: 4.2
+  v_discharge_min: 3.0
+  i_charge_a: 0.5
+  i_discharge_a: 0.5
+  sample_period_s: 1.0
+  ir_pulse_current_a: 1.0
+  ir_pulse_duration_s: 1.0
+  rest_after_charge_s: 300
+  rest_after_discharge_s: 300
