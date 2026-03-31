@@ -29,7 +29,6 @@ def write_csv_header(path: str) -> None:
 			"note",
 		])
 
-
 def append_row(
 	path: str,
 	phase: str,
@@ -56,7 +55,6 @@ def append_row(
 			f"{taper_current_a:.6f}",
 			note,
 		])
-
 
 def parse_args():
 	p = argparse.ArgumentParser(
@@ -127,7 +125,6 @@ def parse_args():
 		help="SDM3055 DCV NPLC during logging",
 	)
 	return p.parse_args()
-
 
 def main():
 	args = parse_args()
@@ -352,7 +349,6 @@ def main():
 				relay.dev.close()
 		except Exception:
 			pass
-
 
 if __name__ == "__main__":
 	try:

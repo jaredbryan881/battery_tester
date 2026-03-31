@@ -64,7 +64,7 @@ def append_row(
 
 def parse_args():
 	p = argparse.ArgumentParser(
-		description="Discharge a cell at 0.5C to 3.2 V, log Ah/Wh, then recharge to ~3.75 V and rest 1 hour."
+		description="Discharge a cell at 0.5C to 3.2 V, estimate capacity (Ah/Wh), then recharge by returned Ah to ~50% SOC and rest 1 hour."
 	)
 	p.add_argument("--config", default="../configs/instruments.example.yaml")
 	p.add_argument("--out", required=True, help="Output CSV path")
@@ -94,19 +94,23 @@ def parse_args():
 		help="Abort if initial battery voltage is above this",
 	)
 	p.add_argument(
-		"--storage-termination-current-a",
+		"--target-soc",
 		type=float,
-		default=None,
-		help="Current taper threshold for the 3.75 V recharge. Defaults to C/20.",
+		default=0.50,
+		help="Target SOC after recharge, expressed asa fraction from 0 to 1",
 	)
 	p.add_argument(
-		"--storage-termination-streak",
-		type=int,
-		default=3,
-		help="Require this many consecutive taper-qualifying samples before ending storage recharge.",
-	)
+		"--charge-voltage-ceiling",
+		type=float,
+		default=4.20,
+		help="Maximum allowed battery voltage during the 50% SOC recharge")
 	p.add_argument(
-		"--skip-storage-recharge",
+		"--charge-ceiling-margin-v",
+		type=float,
+		default=0.03,
+		help="Abort 50% SOC recharge if battery approaches ceiling this closely.")
+	p.add_argument(
+		"--skip_return_to_soc",
 		action="store_true",
 		help="Skip recharge-to-storage phase.",
 	)
@@ -209,21 +213,24 @@ def run_discharge_phase(
 		"post_discharge_v": v_post,
 	}
 
-def run_storage_recharge_phase(
+def run_return_to_soc_phase(
 	csv_path: str,
 	sdm: SDM3055,
 	psu: SPD3303X,
 	relay: NoyitoRelay2,
 	channel: int,
 	charge_current_a: float,
-	target_v: float,
-	taper_current_a: float,
+	target_return_ah: float,
+	voltage_ceiling_v: float,
+	ceiling_margin_v: float,
 	sample_period_s: float,
 	nplc: float,
-	termination_streak: int,
 ):
+	returned_ah = 0.0
+	returned_wh = 0.0
+
 	psu.set_track_mode("independent")
-	psu.set_voltage(target_v, channel=channel)
+	psu.set_voltage(voltage_ceiling_v, channel=channel)
 	psu.set_current(charge_current_a, channel=channel)
 
 	relay.set_mode("charge")
@@ -231,17 +238,28 @@ def run_storage_recharge_phase(
 	psu.output_on(channel)
 
 	t0 = time.time()
-	streak = 0
+	prev_t = None
+	prev_i = None
+	prev_v = None
 
 	while True:
-		elapsed = time.time() - t0
+		now = time.time()
+		elapsed = now - t0
+
 		v_batt = sdm.measure_voltage_dc(range_v=20, nplc=nplc)
 		v_psu = psu.measure_voltage(channel)
 		i_psu = psu.measure_current(channel)
 
+		if prev_t is not None:
+			dt_h = (now - prev_t) / 3600.0
+			i_avg = 0.5 * (prev_i + i_psu)
+			p_avg = 0.5 * (prev_v * prev_i + v_batt * i_psu)
+			returned_ah += i_avg * dt_h
+			returned_wh += p_avg * dt_h
+
 		append_row(
 			csv_path,
-			phase="storage_recharge",
+			phase="return_to_soc",
 			elapsed_s=elapsed,
 			battery_voltage_v=v_batt,
 			load_voltage_v=0.0,
@@ -249,8 +267,9 @@ def run_storage_recharge_phase(
 			load_power_w=0.0,
 			psu_voltage_v=v_psu,
 			psu_current_a=i_psu,
-			cap_ah=0.0,
-			cap_wh=0.0,
+			cap_ah=returned_ah,
+			cap_wh=returned_wh,
+			note=f"target_return_ah={target_return_ah:.6f}",
 		)
 
 		print(
@@ -258,19 +277,22 @@ def run_storage_recharge_phase(
 			f"Vbatt={v_batt:6.4f} V  "
 			f"Vpsu={v_psu:6.4f} V  "
 			f"Ipsu={i_psu:6.4f} A"
+			f"Returned={returned_ah:7.4f} Ah / {target_return_ah:7.4f} Ah"
 		)
 
-		close_to_target = v_batt >= (target_v - 0.02)
-		below_taper = i_psu <= taper_current_a
-
-		if close_to_target and below_taper:
-			streak += 1
-		else:
-			streak = 0
-
-		if streak >= termination_streak:
+		if returned_ah >= target_return_ah:
 			break
 
+		if v_batt >= (voltage_ceiling_v - ceiling_margin_v):
+			raise RuntimeError(
+				f"Battery voltage reached {v_batt:.3f} V during return-to-SOC phase, "
+				f"near the ceiling of {voltage_ceiling_v:.3f} V, before target returned Ah "
+				f"was reached. Aborting."
+			)
+
+		prev_t = now
+		prev_i = i_psu
+		prev_v = v_batt
 		time.sleep(sample_period_s)
 
 	psu.output_off(channel)
@@ -281,7 +303,7 @@ def run_storage_recharge_phase(
 	v_post = sdm.measure_voltage_dc(range_v=20, nplc=nplc)
 	append_row(
 		csv_path,
-		phase="storage_recharge_end",
+		phase="return_to_soc_end",
 		elapsed_s=time.time() - t0,
 		battery_voltage_v=v_post,
 		load_voltage_v=0.0,
@@ -289,12 +311,16 @@ def run_storage_recharge_phase(
 		load_power_w=0.0,
 		psu_voltage_v=0.0,
 		psu_current_a=0.0,
-		cap_ah=0.0,
-		cap_wh=0.0,
-		note="storage_target_reached",
+		cap_ah=returned_ah,
+		cap_wh=returned_wh,
+		note="target_return_ah_reached",
 	)
 
-	return {"post_storage_recharge_v": v_post}
+	return {
+		"returned_ah": returned_ah,
+		"returned_wh": returned_wh,
+		"post_return_v": v_post,
+	}
 
 def run_rest_phase(
 	csv_path: str,
@@ -353,13 +379,11 @@ def main():
 
 	cfg = load_config(args.config)
 
-	discharge_current_a = 0.5 * args.capacity_ah # C/2
-	storage_charge_current_a = 0.5 * args.capacity_ah # C/2
-	taper_current_a = (
-		args.storage_termination_current_a
-		if args.storage_termination_current_a is not None
-		else (args.capacity_ah / 20.0)
-	)
+	if not (0.0 < args.target_soc < 1.0):
+		raise ValueError("--target-soc must be between 0 and 1.")
+
+	discharge_current_a = 0.5 * args.capacity_ah  # C/2
+	return_charge_current_a = 0.5 * args.capacity_ah  # C/2
 
 	sdm = None
 	psu = None
@@ -380,7 +404,7 @@ def main():
 		print("  DL  :", dl.identify())
 
 		dl.input_off()
-		psu.output_off(1)
+		psu.output_off(args.psu_channel)
 		relay.set_mode("safe")
 		time.sleep(0.5)
 
@@ -427,24 +451,25 @@ def main():
 			f"{discharge_summary['cap_wh']:.5f} Wh"
 		)
 
-		if not args.skip_storage_recharge:
+		if not args.skip_return_to_soc:
+			target_return_ah = args.target_soc * discharge_summary["cap_ah"]
 			print(
-				f"Recharging to ~{args.storage_v:.3f} V at up to "
-				f"{storage_charge_current_a:.3f} A, terminate at "
-				f"{taper_current_a:.3f} A"
+				f"Returning cell to {args.target_soc:.0%} SOC by recharging "
+				f"{target_return_ah:.5f} Ah at up to {return_charge_current_a:.3f} A "
+				f"with a {args.charge_voltage_ceiling:.3f} V ceiling"
 			)
-			run_storage_recharge_phase(
+			run_return_to_soc_phase(
 				csv_path=args.out,
 				sdm=sdm,
 				psu=psu,
 				relay=relay,
 				channel=args.psu_channel,
-				charge_current_a=storage_charge_current_a,
-				target_v=args.storage_v,
-				taper_current_a=taper_current_a,
+				charge_current_a=return_charge_current_a,
+				target_return_ah=target_return_ah,
+				voltage_ceiling_v=args.charge_voltage_ceiling,
+				ceiling_margin_v=args.charge_ceiling_margin_v,
 				sample_period_s=args.sample_period_s,
 				nplc=args.nplc,
-				termination_streak=args.storage_termination_streak,
 			)
 
 		print(f"Resting for {args.rest_seconds:.0f} s")
@@ -470,7 +495,7 @@ def main():
 			pass
 		try:
 			if psu is not None:
-				psu.output_off(1)
+				psu.output_off(args.psu_channel)
 		except Exception:
 			pass
 		try:
