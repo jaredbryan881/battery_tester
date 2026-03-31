@@ -1,5 +1,6 @@
 import pyvisa
 import serial
+import time
 
 class VisaDevice:
 	# Devices controlled via the Virtual Instrument Software Architecture (VISA) API
